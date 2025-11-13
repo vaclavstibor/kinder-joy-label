@@ -128,7 +128,7 @@ def main():
     st.markdown("---")
     
     # Display current data
-    st.header("📋 Labeled Data")
+    st.header("Labeled Data")
     
     if len(df) > 0:
         # Show data table
