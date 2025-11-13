@@ -13,14 +13,21 @@ st.set_page_config(
 # Toy list (24 toys)
 TOYS = [
     "Nancy", "Mike", "Lucas", "Demogordon", "Steve", "Eleven", "Vecna", 
-    "Eleven Down", "Max Down", "Eleven clip", "Demogorgon pen", 
-    "Steven a Robin pen", "Eica kabel", "Demogorgon clip", "Will", "Max", 
+    "Eleven Down", "Max Down", "Eleven clip", "Demogordon pen", 
+    "Steven and Robin pen", "Eica kabel", "Demogordon clip", "Will", "Max", 
     "Dustin", "Hopper", "Will Donw", "Steve Down", "Eddie Down", 
     "Dustin Down", "Hopper Down", "Robin Down"
 ]
 
-# CSV file path
+# CSV file paths
 CSV_FILE = "labeled_data.csv"
+BACKUP_DIR = "backups"
+BACKUP_FILE = os.path.join(BACKUP_DIR, "backup_data.csv")
+
+def ensure_backup_dir():
+    """Create backup directory if it doesn't exist"""
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
 
 def load_existing_data():
     """Load existing labeled data from CSV"""
@@ -31,9 +38,42 @@ def load_existing_data():
             return pd.DataFrame(columns=["timestamp", "toy", "balls_code", "toy_code", "location_state"])
     return pd.DataFrame(columns=["timestamp", "toy", "balls_code", "toy_code", "location_state"])
 
+def save_backup(new_row):
+    """Save individual submitted item to backup CSV"""
+    ensure_backup_dir()
+    
+    # Create DataFrame from new row
+    new_df = pd.DataFrame([new_row])
+    
+    # Check if backup file exists
+    if os.path.exists(BACKUP_FILE):
+        # Append to existing backup file
+        try:
+            backup_df = pd.read_csv(BACKUP_FILE)
+            backup_df = pd.concat([backup_df, new_df], ignore_index=True)
+            backup_df.to_csv(BACKUP_FILE, index=False)
+        except Exception as e:
+            # If reading fails, create new backup file
+            new_df.to_csv(BACKUP_FILE, index=False)
+    else:
+        # Create new backup file
+        new_df.to_csv(BACKUP_FILE, index=False)
+    
+    # Also create a timestamped individual backup file for extra safety
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    individual_backup = os.path.join(BACKUP_DIR, f"item_{timestamp}.csv")
+    new_df.to_csv(individual_backup, index=False)
+
 def save_data(df):
-    """Save DataFrame to CSV"""
+    """Save DataFrame to CSV and create full backup"""
+    # Save main CSV file
     df.to_csv(CSV_FILE, index=False)
+    
+    # Create timestamped full backup
+    ensure_backup_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    full_backup = os.path.join(BACKUP_DIR, f"full_backup_{timestamp}.csv")
+    df.to_csv(full_backup, index=False)
 
 def main():
     # Centered title
@@ -117,10 +157,16 @@ def main():
                     "location_state": location_state.strip() if location_state else ""
                 }
                 
+                # Save individual item to backup immediately
+                try:
+                    save_backup(new_row)
+                except Exception as e:
+                    st.warning(f"⚠️ Backup save warning: {str(e)}")
+                
                 # Add to DataFrame
                 df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                 
-                # Save to CSV
+                # Save to CSV (also creates full backup)
                 save_data(df)
                 
                 st.success(f"✅ Label saved successfully! (Total: {len(df)} labels)")
