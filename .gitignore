@@ -27,3 +27,9 @@ Thumbs.db
 *.csv
 *.json
 *.toml
+
+# Links
+links.txt
+
+# Bulk load
+bulk_load/

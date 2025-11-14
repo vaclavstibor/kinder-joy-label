@@ -1,12 +1,20 @@
 import streamlit as st
 import pandas as pd
-import os
 from datetime import datetime
-import json
+
+# Import vizualizační modul
+from plot import (
+    plot_toy_frequency_analysis,
+    extract_code_features,
+    perform_pca_analysis,
+    plot_pca_3d,
+    plot_pca_loadings
+)
 
 # Import Firestore - required for the app to work
 try:
     from google.cloud import firestore
+    from google.cloud.firestore_v1.base_query import FieldFilter
     from google.oauth2 import service_account
     FIRESTORE_AVAILABLE = True
 except ImportError:
@@ -28,7 +36,7 @@ TOYS = [
     "Nancy", "Mike", "Lucas", "Demogordon", "Steve", "Eleven", "Vecna", 
     "Eleven Down", "Max Down", "Eleven clip", "Demogordon pen", 
     "Steven and Robin pen", "Erica kabel", "Demogordon clip", "Will", "Max", 
-    "Dustin", "Hopper", "Will Donw", "Steve Down", "Eddie Down", 
+    "Dustin", "Hopper", "Will Down", "Steve Down", "Eddie Down", 
     "Dustin Down", "Hopper Down", "Robin Down"
 ]
 
@@ -36,41 +44,37 @@ TOYS = [
 COLLECTION_NAME = "labels"  # Collection name in Firestore - each label is a separate document
 
 def get_firestore_client():
-    """Initialize Firestore client using Streamlit secrets or service account file"""
+    """Initialize Firestore client using Streamlit secrets (from secrets.toml locally or Streamlit Cloud secrets)"""
     if not FIRESTORE_AVAILABLE:
         return None
     
     try:
-        # Check if credentials are in Streamlit secrets
+        # Check if credentials are in Streamlit secrets (works with secrets.toml locally or Streamlit Cloud secrets)
         if 'gcp_service_account' in st.secrets:
-            creds_info = st.secrets['gcp_service_account']
-            # Convert to dict if it's not already
-            if isinstance(creds_info, dict):
-                project_id = creds_info.get('project_id', None)
-                credentials = service_account.Credentials.from_service_account_info(creds_info)
-            else:
-                # If it's a string, try to parse it as JSON
-                creds_dict = json.loads(creds_info) if isinstance(creds_info, str) else creds_info
-                project_id = creds_dict.get('project_id', None)
-                credentials = service_account.Credentials.from_service_account_info(creds_dict)
-            db = firestore.Client(credentials=credentials, project=project_id)
-            return db
-        elif os.path.exists("secrets.json"):
-            # Try local file (for development)
-            db = firestore.Client.from_service_account_json("secrets.json")
+            # Convert Streamlit secrets to dict - it behaves like a dict
+            creds_dict = dict(st.secrets['gcp_service_account'])
+            
+            # Fix private_key: replace \n escape sequences with actual newlines
+            if 'private_key' in creds_dict and isinstance(creds_dict['private_key'], str):
+                creds_dict['private_key'] = creds_dict['private_key'].replace('\\n', '\n')
+            
+            credentials = service_account.Credentials.from_service_account_info(creds_dict)
+            db = firestore.Client(credentials=credentials, project=creds_dict.get('project_id'))
             return db
     except Exception as e:
-        st.warning(f"Firestore not configured: {str(e)}")
+        st.error(f"Firestore not configured: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
         return None
     return None
 
-@st.cache_data(ttl=5)  # Cache for 5 seconds - balances freshness with performance on Streamlit Cloud
+@st.cache_data(ttl=5, show_spinner=False)  # Cache for 5 seconds - balances freshness with performance on Streamlit Cloud
 def load_existing_data():
     """Load existing labeled data from Firestore"""
     db = get_firestore_client()
     if not db:
         st.error("Firestore is not configured. Please set up your credentials in Streamlit Secrets.")
-        return pd.DataFrame(columns=["timestamp", "toy", "balls_code", "toy_code", "location_state"])
+        return pd.DataFrame(columns=["timestamp", "balls_code", "toy_code", "toy", "location_state"])
     
     try:
         # Get all documents from the collection
@@ -86,7 +90,7 @@ def load_existing_data():
         if records:
             df = pd.DataFrame(records)
             # Ensure all required columns exist
-            required_columns = ["timestamp", "toy", "balls_code", "toy_code", "location_state"]
+            required_columns = ["timestamp", "balls_code", "toy_code", "toy", "location_state"]
             for col in required_columns:
                 if col not in df.columns:
                     df[col] = ""
@@ -96,10 +100,10 @@ def load_existing_data():
             df = df[~(df.astype(str).apply(lambda x: x.str.strip().eq('')).all(axis=1))]
             return df[required_columns]  # Return only required columns in correct order
         else:
-            return pd.DataFrame(columns=["timestamp", "toy", "balls_code", "toy_code", "location_state"])
+            return pd.DataFrame(columns=["timestamp", "balls_code", "toy_code", "toy", "location_state"])
     except Exception as e:
         st.error(f"Error loading from Firestore: {str(e)}")
-        return pd.DataFrame(columns=["timestamp", "toy", "balls_code", "toy_code", "location_state"])
+        return pd.DataFrame(columns=["timestamp", "balls_code", "toy_code", "toy", "location_state"])
 
 def save_backup(new_row):
     """Save individual submitted item to Firestore"""
@@ -112,9 +116,9 @@ def save_backup(new_row):
         # Check for duplicates before adding
         # Query for existing document with same data
         existing_docs = db.collection(COLLECTION_NAME)\
-            .where('timestamp', '==', new_row['timestamp'])\
-            .where('balls_code', '==', new_row['balls_code'])\
-            .where('toy_code', '==', new_row['toy_code'])\
+            .where(filter=FieldFilter('timestamp', '==', new_row['timestamp']))\
+            .where(filter=FieldFilter('balls_code', '==', new_row['balls_code']))\
+            .where(filter=FieldFilter('toy_code', '==', new_row['toy_code']))\
             .limit(1)\
             .stream()
         
@@ -149,9 +153,10 @@ def save_data(df):
     pass
 
 def main():
+    
     # Centered title
     st.markdown(
-        "<h1 style='text-align: center; margin-bottom: 2rem;'>Stranger Things Labeling Dataset</h1>",
+        "<h1 style='text-align: center; margin-bottom: 2rem;'>Stranger Things Dataset Labeling</h1>",
         unsafe_allow_html=True
     )
 
@@ -162,7 +167,7 @@ def main():
     )
 
     
-    # Load existing data
+    # Load existing data (cached, so it's fast)
     df = load_existing_data()
     
     # Main form
@@ -203,7 +208,7 @@ def main():
             )
         
         # Wide Submit button below inputs
-        submitted = st.form_submit_button("Submit", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Submit", type="primary", width='stretch')
         
         if submitted:
             # Validation
@@ -231,11 +236,17 @@ def main():
                     "location_state": location_state.strip() if location_state else ""
                 }
                 
-                # Reload latest data to get any concurrent submissions from other users
-                load_existing_data.clear()  # Clear cache first to get fresh data
-                
-                # Save new row to Firestore
-                save_backup(new_row)
+                # Save with status indicator (non-blocking)
+                with st.status("Saving label...", expanded=False) as status:
+                    # Reload latest data to get any concurrent submissions from other users
+                    load_existing_data.clear()  # Clear cache first to get fresh data
+                    
+                    # Save new row to Firestore
+                    if save_backup(new_row):
+                        status.update(label="Label saved!", state="complete")
+                    else:
+                        status.update(label="Failed to save label", state="error")
+                        st.stop()
                 
                 # Clear cache to force reload on next render so all users see the update
                 load_existing_data.clear()
@@ -251,23 +262,163 @@ def main():
     st.header("Labeled Data")
     
     if len(df) > 0:
+        # Format timestamp for display (remove microseconds)
+        df_display = df.copy()
+        if 'timestamp' in df_display.columns:
+            # Convert timestamp to string format without microseconds
+            def format_timestamp(ts):
+                if pd.isna(ts):
+                    return ts
+                if isinstance(ts, str):
+                    # If string, remove everything after the dot (microseconds)
+                    if '.' in ts and 'T' in ts:
+                        return ts.split('.')[0]
+                    return ts
+                elif isinstance(ts, datetime):
+                    # If datetime object, format without microseconds
+                    return ts.strftime("%Y-%m-%dT%H:%M:%S")
+                return ts
+            
+            df_display['timestamp'] = df_display['timestamp'].apply(format_timestamp)
+        
         # Show data table
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df_display, width='stretch', hide_index=True)
         
         # Summary statistics
         with st.expander("📈 View Summary Statistics"):
+            # Metrics    
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Total Entries", len(df))
+                st.markdown(
+                    f"<div style='text-align: center;'>"
+                    f"<h3 style='margin-bottom: 0;'>{len(df)}</h3>"
+                    f"<p style='margin-top: 0; color: gray;'>Total Entries</p>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
             with col2:
-                st.metric("Unique Toys", df["toy"].nunique())
+                st.markdown(
+                    f"<div style='text-align: center;'>"
+                    f"<h3 style='margin-bottom: 0;'>{df['toy'].nunique()}</h3>"
+                    f"<p style='margin-top: 0; color: gray;'>Unique Toys</p>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
             with col3:
-                st.metric("With Location", len(df[df["location_state"] != ""]))
+                st.markdown(
+                    f"<div style='text-align: center;'>"
+                    f"<h3 style='margin-bottom: 0;'>{len(df[df['location_state'] != ''])}</h3>"
+                    f"<p style='margin-top: 0; color: gray;'>With Location</p>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
             
             if len(df) > 0:
-                st.subheader("Toy Distribution")
-                toy_counts = df["toy"].value_counts()
-                st.bar_chart(toy_counts)
+                st.markdown("<h2 style='text-align: center;'>Toy Distribution</h2>", unsafe_allow_html=True)
+                fig = plot_toy_frequency_analysis(df)
+                if fig:
+                    st.plotly_chart(fig, width='stretch')
+
+            # PCA Analysis
+            if len(df) >= 3:
+                # Extract features
+                df_features = extract_code_features(df)
+                
+                # Perform PCA with 3 components
+                pca, pca_data, explained_variance, feature_names = perform_pca_analysis(df_features, n_components=3)
+                
+                if pca is not None and pca_data is not None:
+                    # Initialize color_by in session state if not exists
+                    if 'pca_color_by' not in st.session_state:
+                        st.session_state.pca_color_by = 'TOY'
+                    
+                    # Number of clusters - initialize in session state if not exists
+                    if 'pca_n_clusters' not in st.session_state:
+                        st.session_state.pca_n_clusters = min(5, len(df) // 2) if len(df) > 0 else 5
+                    
+                    # 3D PCA Scatter Plot - centered title
+                    st.markdown("<h2 style='text-align: center;'>3D PCA Visualization</h2>", unsafe_allow_html=True)
+                    
+                    # Color by selection - segmented control over full width (below title)
+                    color_by = st.segmented_control(
+                        "Color by:",
+                        options=['TOY', 'CLUSTER'],
+                        default=st.session_state.pca_color_by,
+                        #help="Choose how to color points in the 3D plot",
+                        width='stretch',
+                        label_visibility="hidden"
+                    )
+                    st.session_state.pca_color_by = color_by
+                    
+                    # Number of clusters if needed
+                    if color_by == 'CLUSTER':
+                        col1, col2, col3 = st.columns([1, 1, 1])
+                        with col2:
+                            n_clusters = st.number_input(
+                                "Number of clusters:",
+                                min_value=2,
+                                max_value=min(10, len(df)),
+                                value=st.session_state.pca_n_clusters,
+                                step=1,
+                                help="Number of clusters for KMeans clustering"
+                            )
+                            st.session_state.pca_n_clusters = n_clusters
+                    else:
+                        n_clusters = None
+                    
+                    # 3D PCA Scatter Plot - centered
+                    col1, col2, col3 = st.columns([1, 10, 1])
+                    with col2:
+                        # Convert to lowercase for plot function
+                        color_by_lower = st.session_state.pca_color_by.lower()
+                        pca_fig = plot_pca_3d(pca_data, explained_variance, color_by=color_by_lower, n_clusters=n_clusters)
+                        if pca_fig:
+                            st.plotly_chart(pca_fig, width='stretch')
+                    
+                    # PCA Statistics - centered text
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.markdown(
+                            f"<div style='text-align: center;'>"
+                            f"<h3 style='margin-bottom: 0;'>{sum(explained_variance[:3]):.1%}</h3>"
+                            f"<p style='margin-top: 0; color: gray;'>Total Variance Explained (PC1+PC2+PC3)</p>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+                    with col2:
+                        st.markdown(
+                            f"<div style='text-align: center;'>"
+                            f"<h3 style='margin-bottom: 0;'>{len(feature_names)}</h3>"
+                            f"<p style='margin-top: 0; color: gray;'>Number of Features</p>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+                    with col3:
+                        st.markdown(
+                            f"<div style='text-align: center;'>"
+                            f"<h3 style='margin-bottom: 0;'>{len(pca_data)}</h3>"
+                            f"<p style='margin-top: 0; color: gray;'>Data Points</p>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+                    
+                    # Explained Variance
+                    #st.subheader("Explained Variance by Component")
+                    #variance_fig = plot_pca_variance_explained(explained_variance)
+                    #if variance_fig:
+                    #    st.plotly_chart(variance_fig, use_container_width=True)
+                    
+                    # PCA Loadings
+                    st.markdown("<h2 style='text-align: center;'>PCA Feature Loadings</h2>", unsafe_allow_html=True)
+                    st.caption("Shows how each feature contributes to the principal components")
+                    loadings_fig = plot_pca_loadings(pca, feature_names, n_components=3)
+                    if loadings_fig:
+                        st.plotly_chart(loadings_fig, width='stretch')
+                else:
+                    st.warning("Not enough numerical features for PCA analysis. Need at least 2 features.")
+            else:
+                st.info("Need at least 3 data points for PCA analysis.")
     else:
         st.info("No labels yet. Start adding labels using the form above!")
     
