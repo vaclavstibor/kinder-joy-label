@@ -32,3 +32,6 @@ links.txt
 
 # Bulk load
 bulk_load/
+
+# Trained model
+model/train_model.py

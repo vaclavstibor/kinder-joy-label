@@ -1,5 +1,8 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+import pickle
+import os
 from datetime import datetime
 
 # Import vizualizační modul
@@ -8,8 +11,11 @@ from plot import (
     extract_code_features,
     perform_pca_analysis,
     plot_pca_3d,
-    plot_pca_loadings
+    plot_pca_loadings,
+    ml_pipeline_feature_engineering,
+    ml_pipeline_encode_features
 )
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 # Import Firestore - required for the app to work
 try:
@@ -68,6 +74,20 @@ def get_firestore_client():
         st.code(traceback.format_exc())
         return None
     return None
+
+@st.cache_resource  # Cache model loading (loads only once)
+def load_prediction_model(model_path="./model/model.pkl"):
+    """Load trained model from pickle file"""
+    if not os.path.exists(model_path):
+        return None
+    
+    try:
+        with open(model_path, 'rb') as f:
+            model_data = pickle.load(f)
+        return model_data
+    except Exception as e:
+        st.error(f"Failed to load model: {str(e)}")
+        return None
 
 @st.cache_data(ttl=60, show_spinner=True)  # Increased cache to 60 seconds for better mobile performance
 def load_existing_data():
@@ -177,7 +197,8 @@ def main():
             balls_code = st.text_input(
                 "Balls Code *",
                 help="Must be at least 1 character",
-                placeholder="Enter balls code"
+                placeholder="Enter balls code",
+                max_chars=3
             )
         
         with col2:
@@ -185,7 +206,8 @@ def main():
             toy_code = st.text_input(
                 "Toy Code *",
                 help="Must be at least 1 character",
-                placeholder="Enter toy code"
+                placeholder="Enter toy code",
+                max_chars=4
             )
         
         with col3:
@@ -201,7 +223,8 @@ def main():
             location_state = st.text_input(
                 "Location State (Optional)",
                 help="Optional location information",
-                placeholder="Enter location state"
+                placeholder="Enter location state",
+                max_chars=12
             )
         
         # Wide Submit button below inputs
@@ -284,35 +307,41 @@ def main():
         
         # Show data table
         st.dataframe(df_display, width='stretch', hide_index=True)
-        
+    
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(
+                f"<div style='text-align: center;'>"
+                f"<h3 style='margin-bottom: 0;'>{len(df)}</h3>"
+                f"<p style='margin-top: 0; color: gray;'>Total Entries</p>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with col2:
+            st.markdown(
+                f"<div style='text-align: center;'>"
+                f"<h3 style='margin-bottom: 0;'>{df['toy'].nunique()}</h3>"
+                f"<p style='margin-top: 0; color: gray;'>Unique Toys</p>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with col3:
+            st.markdown(
+                f"<div style='text-align: center;'>"
+                f"<h3 style='margin-bottom: 0;'>{len(df[df['location_state'] != ''])}</h3>"
+                f"<p style='margin-top: 0; color: gray;'>With Location</p>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
         # Summary statistics - in collapsed expander
         with st.expander("📈 View Summary Statistics", expanded=False):
             # Metrics    
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.markdown(
-                    f"<div style='text-align: center;'>"
-                    f"<h3 style='margin-bottom: 0;'>{len(df)}</h3>"
-                    f"<p style='margin-top: 0; color: gray;'>Total Entries</p>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-            with col2:
-                st.markdown(
-                    f"<div style='text-align: center;'>"
-                    f"<h3 style='margin-bottom: 0;'>{df['toy'].nunique()}</h3>"
-                    f"<p style='margin-top: 0; color: gray;'>Unique Toys</p>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-            with col3:
-                st.markdown(
-                    f"<div style='text-align: center;'>"
-                    f"<h3 style='margin-bottom: 0;'>{len(df[df['location_state'] != ''])}</h3>"
-                    f"<p style='margin-top: 0; color: gray;'>With Location</p>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
             
             if len(df) > 0:
                 st.markdown("<h2 style='text-align: center;'>Toy Distribution</h2>", unsafe_allow_html=True)
@@ -327,59 +356,27 @@ def main():
                     # Extract features
                     df_features = extract_code_features(df)
                     
-                    # Perform PCA with 3 components
-                    pca, pca_data, explained_variance, feature_names = perform_pca_analysis(df_features, n_components=3)
+                    # Perform PCA with 3 components using ML pipeline features
+                    result = perform_pca_analysis(df_features, n_components=3, use_ml_pipeline=True)
+                    if result[0] is not None:
+                        pca, pca_data, explained_variance, feature_names, X_scaled, scaler, clusters, toy_encoder, y = result
+                    else:
+                        pca, pca_data, explained_variance, feature_names = None, None, None, None
+                        clusters, toy_encoder, y, X_scaled, scaler = None, None, None, None, None
                 
                 if pca is not None and pca_data is not None:
-                    # Initialize color_by in session state if not exists
-                    if 'pca_color_by' not in st.session_state:
-                        st.session_state.pca_color_by = 'TOY'
-                    
-                    # Number of clusters - initialize in session state if not exists
-                    if 'pca_n_clusters' not in st.session_state:
-                        st.session_state.pca_n_clusters = min(5, len(df) // 2) if len(df) > 0 else 5
-                    
                     # 3D PCA Scatter Plot - centered title
                     st.markdown("<h2 style='text-align: center;'>3D PCA Visualization</h2>", unsafe_allow_html=True)
                     
-                    # Color by selection - segmented control over full width (below title)
-                    color_by = st.segmented_control(
-                        "Color by:",
-                        options=['TOY', 'CLUSTER'],
-                        default=st.session_state.pca_color_by,
-                        #help="Choose how to color points in the 3D plot",
-                        width='stretch',
-                        label_visibility="hidden"
-                    )
-                    st.session_state.pca_color_by = color_by
-                    
-                    # Number of clusters if needed
-                    if color_by == 'CLUSTER':
-                        col1, col2, col3 = st.columns([1, 1, 1])
-                        with col2:
-                            n_clusters = st.number_input(
-                                "Number of clusters:",
-                                min_value=2,
-                                max_value=min(10, len(df)),
-                                value=st.session_state.pca_n_clusters,
-                                step=1,
-                                help="Number of clusters for KMeans clustering"
-                            )
-                            st.session_state.pca_n_clusters = n_clusters
-                    else:
-                        n_clusters = None
-                    
-                    # 3D PCA Scatter Plot - centered
+                    # 3D PCA Scatter Plot - centered (always colored by toy)
                     col1, col2, col3 = st.columns([1, 10, 1])
                     with col2:
-                        # Convert to lowercase for plot function
-                        color_by_lower = st.session_state.pca_color_by.lower()
                         with st.spinner("Generating 3D visualization..."):
-                            pca_fig = plot_pca_3d(pca_data, explained_variance, color_by=color_by_lower, n_clusters=n_clusters)
+                            pca_fig = plot_pca_3d(pca_data, explained_variance, X_scaled=X_scaled, scaler=scaler, y=y, toy_encoder=toy_encoder, color_by='toy')
                             if pca_fig:
                                 # Safari WebGL fix - use specific config
                                 st.plotly_chart(pca_fig, width="stretch", config={'displayModeBar': False})
-                    
+                                        
                     # PCA Statistics - centered text
                     st.markdown("<br>", unsafe_allow_html=True)
                     col1, col2, col3 = st.columns(3)
@@ -428,12 +425,163 @@ def main():
     else:
         st.info("No labels yet. Start adding labels using the form above!")
     
+    # ML Prediction Section - Password Protected
+    #st.markdown("<br>", unsafe_allow_html=True)
+    
+    with st.expander("🚀 Try Predictive Model", expanded=False):
+        # Password protection
+        if 'model_access' not in st.session_state:
+            st.session_state.model_access = False
+        
+        if not st.session_state.model_access:
+            password = st.text_input("Enter password to access prediction model:", type="password", key="prediction_password_input")
+            if st.button("Unlock", type="primary", key="unlock_model"):
+                # Load password directly from secrets.toml file
+                try:
+                    correct_password = None
+
+                    if 'try_model_secrets' in st.secrets:
+                        correct_password = st.secrets['try_model_secrets']['model_password']
+                    
+                    if correct_password and password == str(correct_password):
+                        st.session_state.model_access = True
+                        st.rerun()
+                    else:
+                        st.error("Incorrect password")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+        
+        if st.session_state.model_access:
+            # Prediction form
+            st.markdown("<h3 style='text-align: center; margin-bottom: 1rem;'>Predict Toy</h3>", unsafe_allow_html=True)
+            
+            with st.form("prediction_form", clear_on_submit=False):
+                # Three inputs side by side (like labeling form)
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    pred_balls_code = st.text_input(
+                        "Balls Code *",
+                        help="Enter balls code (e.g., S1A)",
+                        placeholder="S1A",
+                        max_chars=3,
+                        key="pred_balls_code"
+                    )
+                
+                with col2:
+                    pred_toy_code = st.text_input(
+                        "Toy Code *",
+                        help="Enter toy code (e.g., 18S1)",
+                        placeholder="38G1",
+                        max_chars=4,
+                        key="pred_toy_code"
+                    )
+                
+                with col3:
+                    pred_location_state = st.text_input(
+                        "Location State (Optional)",
+                        help="Optional location information",
+                        placeholder="CZE",
+                        max_chars=12,
+                        key="pred_location_state"
+                    )
+                
+                # Wide Predict button below inputs
+                predict_clicked = st.form_submit_button("Predict", type="primary", use_container_width=True)
+                
+                if predict_clicked:
+                    # Validation
+                    errors = []
+                    if not pred_balls_code or len(pred_balls_code.strip()) < 1:
+                        errors.append("Balls code is required")
+                    if not pred_toy_code or len(pred_toy_code.strip()) < 1:
+                        errors.append("Toy code is required")
+                    
+                    if errors:
+                        for error in errors:
+                            st.error(error)
+                    else:
+                        # Load model (cached) and predict
+                        model_data = load_prediction_model()
+                        
+                        if model_data is None:
+                            st.error(f"Model file not found at ./model/model.pkl or failed to load")
+                        else:
+                            try:
+                                with st.spinner("Making prediction..."):
+                                    model = model_data['model']
+                                    scaler = model_data['scaler']
+                                    label_encoder = model_data['label_encoder']
+                                    feature_names = model_data['feature_names']
+                                    # Get categorical encoders (if available in saved model)
+                                    categorical_encoders = model_data.get('categorical_encoders', None)
+                                    
+                                    # Prepare input data
+                                    input_df = pd.DataFrame({
+                                        'balls_code': [pred_balls_code.strip()],
+                                        'toy_code': [pred_toy_code.strip()],
+                                        'location_state': [pred_location_state.strip() if pred_location_state else ""],
+                                        'timestamp': [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+                                    })
+                                    
+                                    # Feature engineering
+                                    features = ml_pipeline_feature_engineering(input_df)
+                                    
+                                    # Encode features using saved categorical encoders from training
+                                    X_array, _, _, feature_names_encoded = ml_pipeline_encode_features(
+                                        features, categorical_encoders=categorical_encoders
+                                    )
+                                    
+                                    if X_array is None or len(X_array) == 0:
+                                        st.error("Failed to extract features")
+                                    else:
+                                        # Create DataFrame with encoded features
+                                        X_df = pd.DataFrame(X_array, columns=feature_names_encoded)
+                                        
+                                        # Ensure feature order matches training
+                                        if feature_names:
+                                            # Add missing features as zeros
+                                            for f in feature_names:
+                                                if f not in X_df.columns:
+                                                    X_df[f] = 0
+                                            
+                                            # Reorder to match training order
+                                            X_df = X_df[feature_names]
+                                        
+                                        # Scale features
+                                        X_scaled = scaler.transform(X_df)
+                                        
+                                        # Predict probabilities
+                                        probs = model.predict_proba(X_scaled)[0]
+                                        
+                                        # Get top 3 predictions
+                                        top3_indices = np.argsort(probs)[::-1][:3]
+                                        top3_probs = probs[top3_indices]
+                                        top3_toys = label_encoder.inverse_transform(top3_indices)
+                                        
+                                        # Display results
+                                        st.markdown("<br>", unsafe_allow_html=True)
+                                        st.markdown("<h4 style='text-align: center; margin-bottom: 1rem;'>Top 3 Predictions</h4>", unsafe_allow_html=True)
+                                        
+                                        # Display top 3 in a nice format
+                                        for i, (toy, prob) in enumerate(zip(top3_toys, top3_probs)):
+                                            if i == 0:
+                                                st.success(f"🥇 {toy}: {prob:.1%} confidence")
+                                            elif i == 1:
+                                                st.info(f"🥈 {toy}: {prob:.1%} confidence")
+                                            else:
+                                                st.info(f"🥉 {toy}: {prob:.1%} confidence")
+                            except Exception as e:
+                                st.error(f"Prediction failed: {str(e)}")
+                                import traceback
+                                st.code(traceback.format_exc())
+    
     # Footer
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: gray;'>"
         "Stivanborčo Lab - "
-        "<a href='https://cz.linkedin.com/in/václav-stibor-a26892293' target='_blank' style='color: gray; text-decoration: none;'>Václav Stibor</a>, "
+        "<a href='https://www.instagram.com/p/DPevvGWEuF4/?igsh=eTQ1N3E4eDNpazE%3D' target='_blank' style='color: gray; text-decoration: none;'>Václav Stibor</a>, "
         "<a href='https://cz.linkedin.com/in/filip-vančo-a675a4288' target='_blank' style='color: gray; text-decoration: none;'>Filip Vančo</a>"
         "</div>",
         unsafe_allow_html=True
