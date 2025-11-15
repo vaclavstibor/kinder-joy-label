@@ -435,7 +435,7 @@ def main():
         
         if not st.session_state.model_access:
             password = st.text_input("Enter password to access prediction model:", type="password", key="prediction_password_input")
-            if st.button("Unlock", type="primary", key="unlock_model"):
+            if st.button("Unlock", type="primary", key="unlock_model", width="stretch"):
                 # Load password directly from secrets.toml file
                 try:
                     correct_password = None
