@@ -47,7 +47,12 @@ TOYS = [
 ]
 
 # Firestore configuration
-COLLECTION_NAME = "labels"  # Collection name in Firestore - each label is a separate document
+# IMPORTANT: All reads/writes use all_labels_in_one/all_labels (1 read/write operation)
+# The old 'labels' collection with individual documents is ignored
+# Migration code moved to migration.py for future use if needed
+COLLECTION_NAME = "labels"  # Old collection with individual documents (not used for reads/writes)
+SINGLE_DOC_COLLECTION = "all_labels_in_one"  # Collection for the single aggregated document (USED FOR ALL OPERATIONS)
+SINGLE_DOC_ID = "all_labels"  # Document ID storing all labels (1 read instead of N reads)
 
 @st.cache_resource  # Cache the client as a resource (persists across reruns)
 def get_firestore_client():
@@ -89,24 +94,34 @@ def load_prediction_model(model_path="./model/model.pkl"):
         st.error(f"Failed to load model: {str(e)}")
         return None
 
-@st.cache_data(ttl=60, show_spinner=True)  # Increased cache to 60 seconds for better mobile performance
+@st.cache_data(ttl=3600, show_spinner=True)  # Cache for 1 hour to reduce Firestore reads
 def load_existing_data():
-    """Load existing labeled data from Firestore"""
+    """
+    Load existing labeled data from Firestore - optimized to use single document (1 read total)
+    Reads from all_labels_in_one/all_labels collection
+    """
     db = get_firestore_client()
     if not db:
         st.error("Firestore is not configured. Please set up your credentials in Streamlit Secrets.")
         return pd.DataFrame(columns=["timestamp", "balls_code", "toy_code", "toy", "location_state"])
     
     try:
-        # Get all documents from the collection
-        docs = db.collection(COLLECTION_NAME).stream()
+        # IMPORTANT: Read ONLY from all_labels_in_one/all_labels (1 read operation for all data)
+        # This ensures we're not reading from the old all_labels document in labels collection
+        doc_ref = db.collection(SINGLE_DOC_COLLECTION).document(SINGLE_DOC_ID)
+        doc = doc_ref.get()
         
-        # Convert to list of dictionaries
-        records = []
-        for doc in docs:
-            doc_data = doc.to_dict()
-            if doc_data:  # Only add non-empty documents
-                records.append(doc_data)
+        if doc.exists:
+            # Single document approach - all labels stored as array in one document
+            data = doc.to_dict()
+            if data and 'labels' in data:
+                records = data['labels']
+            else:
+                records = []
+        else:
+            # Document doesn't exist yet - return empty DataFrame
+            # Migration should be run manually if needed
+            records = []
         
         if records:
             df = pd.DataFrame(records)
@@ -124,39 +139,63 @@ def load_existing_data():
             return pd.DataFrame(columns=["timestamp", "balls_code", "toy_code", "toy", "location_state"])
     except Exception as e:
         st.error(f"Error loading from Firestore: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
         return pd.DataFrame(columns=["timestamp", "balls_code", "toy_code", "toy", "location_state"])
 
 def save_backup(new_row):
-    """Save individual submitted item to Firestore"""
+    """
+    Save individual submitted item to Firestore using single document approach with transaction
+    Writes to all_labels_in_one/all_labels collection (1 write operation)
+    """
     db = get_firestore_client()
     if not db:
         st.error("Firestore is not configured. Please set up your credentials in Streamlit Secrets.")
         return False
     
     try:
-        # Check for duplicates before adding
-        # Query for existing document with same data
-        existing_docs = db.collection(COLLECTION_NAME)\
-            .where(filter=FieldFilter('timestamp', '==', new_row['timestamp']))\
-            .where(filter=FieldFilter('balls_code', '==', new_row['balls_code']))\
-            .where(filter=FieldFilter('toy_code', '==', new_row['toy_code']))\
-            .limit(1)\
-            .stream()
+        # Write to single document in all_labels_in_one collection
+        doc_ref = db.collection(SINGLE_DOC_COLLECTION).document(SINGLE_DOC_ID)
         
-        # Check if duplicate exists
-        is_duplicate = any(True for _ in existing_docs)
+        # Use transaction to safely append to single document (prevents data loss on concurrent writes)
+        transaction = db.transaction()
         
-        if not is_duplicate:
-            # Create a new document with auto-generated ID
-            # This avoids write conflicts - each write is to a different document
-            db.collection(COLLECTION_NAME).add(new_row)
+        @firestore.transactional
+        def update_labels(transaction):
+            doc = doc_ref.get(transaction=transaction)
+            
+            if doc.exists:
+                data = doc.to_dict()
+                labels = data.get('labels', [])
+            else:
+                labels = []
+            
+            # Check for duplicates
+            is_duplicate = any(
+                label.get('timestamp') == new_row['timestamp'] and
+                label.get('balls_code') == new_row['balls_code'] and
+                label.get('toy_code') == new_row['toy_code']
+                for label in labels
+            )
+            
+            if not is_duplicate:
+                labels.append(new_row)
+                transaction.set(doc_ref, {'labels': labels})
+                return True
+            else:
+                return False
+        
+        result = update_labels(transaction)
+        
+        if result:
             return True  # Successfully saved to Firestore
         else:
-            # Duplicate found, skip saving
             st.info("This label already exists, skipping duplicate.")
             return False
     except Exception as e:
         st.error(f"Error saving to Firestore: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
         return False
 
 def save_data(df):
@@ -258,25 +297,19 @@ def main():
                 
                 # Save with status indicator (non-blocking)
                 with st.status("Saving label...", expanded=False) as status:
-                    # Reload latest data to get any concurrent submissions from other users
-                    load_existing_data.clear()  # Clear cache first to get fresh data
-                    
                     # Save new row to Firestore
                     if save_backup(new_row):
                         status.update(label="Label saved!", state="complete")
+                        # Only clear cache after successful save to reduce unnecessary reads
+                        load_existing_data.clear()
                     else:
                         status.update(label="Failed to save label", state="error")
                         st.stop()
                 
-                # Clear cache to force reload on next render so all users see the update
-                load_existing_data.clear()
-                
-                # Reload to get updated count
+                # Reload to get updated count (cache was cleared, so this will fetch fresh data)
                 df_final = load_existing_data()
                 st.success(f"Label saved successfully! (Total: {len(df_final)} labels)")
                 st.rerun()  # Rerun to refresh the page and show updated data from all users
-    
-    #st.markdown("---")
     
     # Load existing data (after form, so form shows immediately)
     with st.spinner("Loading data..."):
